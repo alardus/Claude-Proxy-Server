@@ -1,0 +1,9 @@
+fastapi 
+fastapi.security
+fastapi.responses
+httpx
+uvicorn
+anthropic
+python-dotenv
+jinja2
+python-multipart

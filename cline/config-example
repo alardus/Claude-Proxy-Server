@@ -1,0 +1,4 @@
+API Provider: Anthropic
+Anthropic API Key: your_proxy_api_key
+Anthropic API Base: your_proxy_base_url
+Model: claude-3-5-sonnet-20241022

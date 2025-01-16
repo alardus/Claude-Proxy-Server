@@ -1,0 +1,29 @@
+# Configuration file for aichat
+# This file is used to configure the aichat application
+
+# Model settings for Claude
+model: claude:claude-3-5-sonnet-20241022
+stream: true
+save: true
+wrap: 85
+wrap_code: false
+clients:
+  - type: claude
+    api_base: YOUR_PROXY_BASE_URL/v1
+    api_key: YOUR_PROXY_API_KEY
+
+# Model settings forlocal Qwen (feat. Ollama)
+  - type: openai-compatible
+    name: local
+    api_base: http://localhost:11434/v1
+    api_key: xxx                                      # Optional
+    models:
+      - name:   qwen2.5-coder:0.5b
+        max_input_tokens: 128000
+        supports_function_calling: true
+      - name: jina-embeddings-v2-base-en
+        type: embedding
+        default_chunk_size: 1500
+        max_batch_size: 100
+      - name: jina-reranker-v2-base-multilingual
+        type: reranker
