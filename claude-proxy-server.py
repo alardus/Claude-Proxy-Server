@@ -1,6 +1,6 @@
-from fastapi import FastAPI, Request, HTTPException, Depends, Form
+from fastapi import FastAPI, Request, HTTPException, Depends, Form, Response
 from fastapi.security import APIKeyHeader
-from fastapi.responses import StreamingResponse, HTMLResponse
+from fastapi.responses import StreamingResponse, HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 import httpx
 import uvicorn
@@ -89,13 +89,25 @@ request_stats = {
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "your_secure_password")
 
-# Функция для аутентификации админа
+# Добавляем новые константы для работы с куки
+COOKIE_NAME = "admin_session"
+COOKIE_MAX_AGE = 3600  # 1 час
+
+# Обновляем функцию verify_admin для работы с куки
 async def verify_admin(
     request: Request,
-    username: str = Form(...),
-    password: str = Form(...)
+    response: Response,
+    username: str = Form(None),
+    password: str = Form(None)
 ):
     client_ip = request.client.host
+    
+    # Проверяем существующую куки
+    if not username and not password:
+        cookie = request.cookies.get(COOKIE_NAME)
+        if cookie == ADMIN_PASSWORD:  # В реальном приложении используйте более безопасный метод
+            return True
+        raise HTTPException(status_code=401, detail="Unauthorized")
     
     # Проверяем rate limit перед проверкой учетных данных
     if time.time() < block_until[client_ip]:
@@ -123,18 +135,33 @@ async def verify_admin(
         )
     
     failed_attempts[client_ip] = 0
+    response.set_cookie(
+        key=COOKIE_NAME,
+        value=ADMIN_PASSWORD,  # В реальном приложении используйте токен
+        max_age=COOKIE_MAX_AGE,
+        httponly=True,
+        secure=True
+    )
     return True
 
+# Обновляем маршрут входа в админку
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_login_page(request: Request):
+    # Проверяем, авторизован ли уже пользователь
+    cookie = request.cookies.get(COOKIE_NAME)
+    if cookie == ADMIN_PASSWORD:  # В реальном приложении используйте более безопасный метод
+        return RedirectResponse(url="/admin/dashboard")
+    
     return templates.TemplateResponse(
         "login.html",
         {"request": request}
     )
 
+# Обновляем маршрут дашборда
 @app.post("/admin/dashboard")
 async def admin_dashboard(
     request: Request,
+    response: Response,
     _: bool = Depends(verify_admin)
 ):
     uptime = datetime.now() - request_stats["start_time"]
@@ -162,6 +189,22 @@ async def admin_dashboard(
         "dashboard.html",
         {"request": request, "stats": stats}
     )
+
+# Добавляем новый маршрут для GET-запросов к дашборду
+@app.get("/admin/dashboard")
+async def admin_dashboard_get(
+    request: Request,
+    response: Response,
+    _: bool = Depends(verify_admin)
+):
+    return await admin_dashboard(request, response, _)
+
+# Добавляем маршрут для выхода
+@app.get("/admin/logout")
+async def admin_logout(response: Response):
+    response = RedirectResponse(url="/admin")
+    response.delete_cookie(COOKIE_NAME)
+    return response
 
 # Модифицируем основной обработчик для сбора статистики
 @app.post("/v1/{path:path}")
