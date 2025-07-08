@@ -51,6 +51,9 @@ system_metrics = {
     }
 }
 
+# Thread lock for statistics
+stats_lock = threading.Lock()
+
 # Добавляем новые переменные для статистики
 request_stats = {
     "total_requests": 0,
@@ -631,8 +634,9 @@ async def proxy_request(
     client_ip = get_client_ip(request)
     
     try:
-        request_stats["total_requests"] += 1
-        request_stats["requests_by_ip"][client_ip] += 1
+        with stats_lock:
+            request_stats["total_requests"] += 1
+            request_stats["requests_by_ip"][client_ip] += 1
         
         body = await request.json()
         headers = {
@@ -652,10 +656,11 @@ async def proxy_request(
                         timeout=None
                     ) as response:
                         # Проверяем статус ответа
-                        if 400 <= response.status_code < 500:
-                            system_metrics["errors_4xx"] += 1
-                        elif response.status_code >= 500:
-                            system_metrics["errors_5xx"] += 1
+                        with stats_lock:
+                            if 400 <= response.status_code < 500:
+                                system_metrics["errors_4xx"] += 1
+                            elif response.status_code >= 500:
+                                system_metrics["errors_5xx"] += 1
                             
                         async for chunk in response.aiter_bytes():
                             yield chunk
@@ -663,18 +668,19 @@ async def proxy_request(
                 # Обновляем статистику после успешного запроса
                 end_time = time.time()
                 response_time = (end_time - start_time) * 1000  # в миллисекундах
-                request_stats["total_response_time"] += response_time
-                request_stats["average_response_time"] = (
-                    request_stats["total_response_time"] / request_stats["total_requests"]
-                )
-                
-                request_stats["last_requests"].append({
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "ip": client_ip,
-                    "path": path,
-                    "response_time": f"{response_time:.2f}ms",
-                    "status": "success"
-                })
+                with stats_lock:
+                    request_stats["total_response_time"] += response_time
+                    request_stats["average_response_time"] = (
+                        request_stats["total_response_time"] / request_stats["total_requests"]
+                    )
+                    
+                    request_stats["last_requests"].append({
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "ip": client_ip,
+                        "path": path,
+                        "response_time": f"{response_time:.2f}ms",
+                        "status": "success"
+                    })
                 
             except Exception as e:
                 request_stats["failed_requests"] += 1
