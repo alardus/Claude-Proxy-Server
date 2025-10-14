@@ -255,6 +255,8 @@ logger = logging.getLogger("app")
 load_dotenv()
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 ANTHROPIC_API_BASE = "https://api.anthropic.com"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_API_BASE = "https://api.openai.com"
 PROXY_API_KEY = os.getenv("PROXY_API_KEY")
 
 # Настройки rate limiting
@@ -395,6 +397,72 @@ async def verify_api_key(request: Request, api_key: str = Depends(api_key_header
     # Проверяем ключ
     if api_key != PROXY_API_KEY:
         logger.warning(f"Invalid API key from {client_ip}")
+        failed_attempts[client_ip] += 1
+        
+        if failed_attempts[client_ip] >= MAX_FAILED_ATTEMPTS:
+            block_until[client_ip] = time.time() + BLOCK_DURATION
+            failed_attempts[client_ip] = 0
+            logger.warning(f"Blocking IP {client_ip} for {BLOCK_DURATION/3600} hours")
+            raise HTTPException(
+                status_code=403,
+                detail=f"Too many failed attempts. IP blocked for {BLOCK_DURATION/3600} hours"
+            )
+            
+        raise HTTPException(
+            status_code=403,
+            detail=f"Invalid API key. {MAX_FAILED_ATTEMPTS - failed_attempts[client_ip]} attempts remaining"
+        )
+    
+    failed_attempts[client_ip] = 0
+    return api_key
+
+# Функция проверки API ключа для OpenAI (поддерживает x-api-key и Authorization Bearer)
+async def verify_api_key_openai(request: Request):
+    client_ip = get_client_ip(request)
+    
+    # Проверяем, не заблокирован ли IP
+    if time.time() < block_until[client_ip]:
+        logger.warning(f"Too many failed attempts from {client_ip}")
+        raise HTTPException(
+            status_code=403,
+            detail=f"Too many failed attempts. Try again in {int(block_until[client_ip] - time.time())} seconds"
+        )
+    
+    # Пытаемся получить ключ из x-api-key заголовка
+    api_key = request.headers.get("x-api-key")
+    
+    # Если нет x-api-key, пытаемся получить из Authorization Bearer
+    if not api_key:
+        auth_header = request.headers.get("authorization")
+        logger.info(f"OpenAI auth - x-api-key: {api_key}, authorization header: {auth_header[:20] if auth_header else None}...")
+        
+        if auth_header:
+            # Проверяем различные варианты написания Bearer
+            if auth_header.startswith("Bearer "):
+                api_key = auth_header[7:]  # Убираем "Bearer "
+            elif auth_header.startswith("bearer "):
+                api_key = auth_header[7:]  # Убираем "bearer "
+            else:
+                logger.warning(f"Invalid Authorization header format from {client_ip}: {auth_header[:50]}")
+    
+    # Логируем полученный ключ (первые и последние 4 символа)
+    if api_key:
+        logger.info(f"Received API key: {api_key[:4]}...{api_key[-4:]} (length: {len(api_key)})")
+        logger.info(f"Expected API key: {PROXY_API_KEY[:4]}...{PROXY_API_KEY[-4:]} (length: {len(PROXY_API_KEY)})")
+    
+    # Если ключ не найден
+    if not api_key:
+        logger.warning(f"No API key provided from {client_ip}")
+        logger.info(f"All headers: {dict(request.headers)}")
+        raise HTTPException(
+            status_code=403,
+            detail="Not authenticated"
+        )
+    
+    # Проверяем ключ
+    if api_key != PROXY_API_KEY:
+        logger.warning(f"Invalid API key from {client_ip}")
+        logger.warning(f"Key mismatch - received: '{api_key}', expected: '{PROXY_API_KEY}'")
         failed_attempts[client_ip] += 1
         
         if failed_attempts[client_ip] >= MAX_FAILED_ATTEMPTS:
@@ -702,6 +770,170 @@ async def proxy_request(
     except Exception as e:
         request_stats["failed_requests"] += 1
         raise
+
+# ============================================================================
+# OpenAI API Proxy Handlers
+# ============================================================================
+
+# Обработчик для /chat/completions (OpenAI Chat API)
+@app.post("/chat/completions")
+async def proxy_openai_chat(
+    request: Request,
+    api_key: str = Depends(verify_api_key_openai)
+):
+    start_time = time.time()
+    client_ip = get_client_ip(request)
+    
+    try:
+        with stats_lock:
+            request_stats["total_requests"] += 1
+            request_stats["requests_by_ip"][client_ip] += 1
+        
+        body = await request.json()
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        async def stream_response():
+            try:
+                async with httpx.AsyncClient() as client:
+                    async with client.stream(
+                        "POST",
+                        f"{OPENAI_API_BASE}/v1/chat/completions",
+                        headers=headers,
+                        json=body,
+                        timeout=None
+                    ) as response:
+                        # Проверяем статус ответа
+                        with stats_lock:
+                            if 400 <= response.status_code < 500:
+                                system_metrics["errors_4xx"] += 1
+                            elif response.status_code >= 500:
+                                system_metrics["errors_5xx"] += 1
+                            
+                        async for chunk in response.aiter_bytes():
+                            yield chunk
+                            
+                # Обновляем статистику после успешного запроса
+                end_time = time.time()
+                response_time = (end_time - start_time) * 1000  # в миллисекундах
+                with stats_lock:
+                    request_stats["total_response_time"] += response_time
+                    request_stats["average_response_time"] = (
+                        request_stats["total_response_time"] / request_stats["total_requests"]
+                    )
+                    
+                    request_stats["last_requests"].append({
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "ip": client_ip,
+                        "path": "/chat/completions (OpenAI)",
+                        "response_time": f"{response_time:.2f}ms",
+                        "status": "success"
+                    })
+                
+            except Exception as e:
+                request_stats["failed_requests"] += 1
+                system_metrics["errors_5xx"] += 1
+                request_stats["last_requests"].append({
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "ip": client_ip,
+                    "path": "/chat/completions (OpenAI)",
+                    "status": "error",
+                    "error": str(e)
+                })
+                raise
+                
+        return StreamingResponse(
+            stream_response(),
+            media_type="text/event-stream"
+        )
+        
+    except Exception as e:
+        request_stats["failed_requests"] += 1
+        raise
+
+# Обработчик для /responses (OpenAI Projects API)
+@app.post("/responses")
+async def proxy_openai_responses(
+    request: Request,
+    api_key: str = Depends(verify_api_key_openai)
+):
+    start_time = time.time()
+    client_ip = get_client_ip(request)
+    
+    try:
+        with stats_lock:
+            request_stats["total_requests"] += 1
+            request_stats["requests_by_ip"][client_ip] += 1
+        
+        body = await request.json()
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        async def stream_response():
+            try:
+                async with httpx.AsyncClient() as client:
+                    async with client.stream(
+                        "POST",
+                        f"{OPENAI_API_BASE}/v1/responses",
+                        headers=headers,
+                        json=body,
+                        timeout=None
+                    ) as response:
+                        # Проверяем статус ответа
+                        with stats_lock:
+                            if 400 <= response.status_code < 500:
+                                system_metrics["errors_4xx"] += 1
+                            elif response.status_code >= 500:
+                                system_metrics["errors_5xx"] += 1
+                            
+                        async for chunk in response.aiter_bytes():
+                            yield chunk
+                            
+                # Обновляем статистику после успешного запроса
+                end_time = time.time()
+                response_time = (end_time - start_time) * 1000  # в миллисекундах
+                with stats_lock:
+                    request_stats["total_response_time"] += response_time
+                    request_stats["average_response_time"] = (
+                        request_stats["total_response_time"] / request_stats["total_requests"]
+                    )
+                    
+                    request_stats["last_requests"].append({
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "ip": client_ip,
+                        "path": "/responses (OpenAI)",
+                        "response_time": f"{response_time:.2f}ms",
+                        "status": "success"
+                    })
+                
+            except Exception as e:
+                request_stats["failed_requests"] += 1
+                system_metrics["errors_5xx"] += 1
+                request_stats["last_requests"].append({
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "ip": client_ip,
+                    "path": "/responses (OpenAI)",
+                    "status": "error",
+                    "error": str(e)
+                })
+                raise
+                
+        return StreamingResponse(
+            stream_response(),
+            media_type="text/event-stream"
+        )
+        
+    except Exception as e:
+        request_stats["failed_requests"] += 1
+        raise
+
+# ============================================================================
+# End of OpenAI API Proxy Handlers
+# ============================================================================
 
 # Добавляем middleware для отслеживания запросов Uvicorn
 @app.middleware("http")
