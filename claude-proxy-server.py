@@ -259,6 +259,14 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_API_BASE = "https://api.openai.com"
 PROXY_API_KEY = os.getenv("PROXY_API_KEY")
 
+# Режим отладки (включается через DEBUG_MODE=true в .env)
+DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
+
+def debug_log(message: str):
+    """Выводит отладочное сообщение, если включен DEBUG_MODE"""
+    if DEBUG_MODE:
+        print(message)
+
 # Настройки rate limiting
 MAX_FAILED_ATTEMPTS = 2  # Максимальное количество неудачных попыток
 BLOCK_DURATION = 3600  # Время блокировки в секундах (1 час)
@@ -586,8 +594,11 @@ async def proxy_anthropic_files(
         headers = {
             "x-api-key": ANTHROPIC_API_KEY,
             "anthropic-version": "2023-06-01",
-            "anthropic-beta": "files-api-2025-04-14"
+            "anthropic-beta": "files-api-2025-04-14,pdfs-2024-09-25"
         }
+        
+        debug_log(f"[ANTHROPIC FILES] Uploading file: {file_name}, content_type: {content_type}")
+        debug_log(f"[ANTHROPIC FILES] File size: {len(file_content)} bytes")
         
         # Подготавливаем файл для отправки
         files = {
@@ -601,6 +612,10 @@ async def proxy_anthropic_files(
                 files=files,
                 timeout=60.0
             )
+            
+            debug_log(f"[ANTHROPIC FILES] Response status: {response.status_code}")
+            response_data = response.json()
+            debug_log(f"[ANTHROPIC FILES] Response data: {response_data}")
             
             # Проверяем статус ответа
             with stats_lock:
@@ -628,7 +643,7 @@ async def proxy_anthropic_files(
             
             return JSONResponse(
                 status_code=response.status_code,
-                content=response.json()
+                content=response_data
             )
             
     except Exception as e:
@@ -797,14 +812,40 @@ async def proxy_request(
             request_stats["requests_by_ip"][client_ip] += 1
         
         body = await request.json()
+        
+        # Логируем входящий запрос
+        debug_log(f"\n{'='*80}")
+        debug_log(f"[ANTHROPIC PROXY] Request to path: /{path}")
+        debug_log(f"[ANTHROPIC PROXY] Query params: {dict(request.query_params)}")
+        debug_log(f"[ANTHROPIC PROXY] Number of messages: {len(body.get('messages', []))}")
+        
+        if body.get('messages'):
+            first_msg = body['messages'][0]
+            content = first_msg.get('content', [])
+            debug_log(f"[ANTHROPIC PROXY] First message has {len(content)} content items")
+            
+            # Проверяем наличие файлов
+            has_files = any('file_id' in str(item) for item in content)
+            debug_log(f"[ANTHROPIC PROXY] Request contains files: {has_files}")
+        
+        debug_log(f"{'='*80}\n")
+        
         headers = {
             "x-api-key": ANTHROPIC_API_KEY,
             "anthropic-version": "2023-06-01",
             "Content-Type": "application/json"
         }
         
+        # Добавляем beta заголовок для поддержки файлов и других бета-функций
+        # Клиент может отправить ?beta=true, но Anthropic требует конкретные версии
+        if request.query_params.get("beta") or "file_id" in str(body):
+            # Добавляем поддержку files API (ВАЖНО: files-api-2025-04-14 должен быть первым!)
+            headers["anthropic-beta"] = "files-api-2025-04-14,pdfs-2024-09-25,prompt-caching-2024-07-31"
+            debug_log(f"[ANTHROPIC PROXY] Added anthropic-beta header: {headers['anthropic-beta']}")
+        
         async def stream_response():
             try:
+                debug_log(f"[ANTHROPIC PROXY] Starting request to Anthropic API...")
                 async with httpx.AsyncClient() as client:
                     async with client.stream(
                         "POST",
@@ -814,14 +855,25 @@ async def proxy_request(
                         timeout=None
                     ) as response:
                         # Проверяем статус ответа
+                        debug_log(f"[ANTHROPIC PROXY] Response status: {response.status_code}")
+                        debug_log(f"[ANTHROPIC PROXY] Response headers: {dict(response.headers)}")
+                        
                         with stats_lock:
                             if 400 <= response.status_code < 500:
                                 system_metrics["errors_4xx"] += 1
                             elif response.status_code >= 500:
                                 system_metrics["errors_5xx"] += 1
-                            
+                        
+                        chunk_count = 0
+                        total_bytes = 0
                         async for chunk in response.aiter_bytes():
+                            chunk_count += 1
+                            total_bytes += len(chunk)
+                            if chunk_count <= 10:  # Логируем первые 10 чанков
+                                debug_log(f"[ANTHROPIC PROXY] Chunk #{chunk_count} ({len(chunk)} bytes): {chunk[:150]}")
                             yield chunk
+                        
+                        debug_log(f"[ANTHROPIC PROXY] Stream complete. Total chunks: {chunk_count}, total bytes: {total_bytes}")
                             
                 # Обновляем статистику после успешного запроса
                 end_time = time.time()
@@ -841,6 +893,12 @@ async def proxy_request(
                     })
                 
             except Exception as e:
+                debug_log(f"[ANTHROPIC PROXY] ERROR in stream_response: {str(e)}")
+                debug_log(f"[ANTHROPIC PROXY] Error type: {type(e).__name__}")
+                if DEBUG_MODE:
+                    import traceback
+                    traceback.print_exc()
+                
                 request_stats["failed_requests"] += 1
                 system_metrics["errors_5xx"] += 1
                 request_stats["last_requests"].append({
@@ -852,12 +910,25 @@ async def proxy_request(
                 })
                 raise
                 
-        return StreamingResponse(
+        # Создаем StreamingResponse с правильными заголовками для Anthropic
+        debug_log(f"[ANTHROPIC PROXY] Creating StreamingResponse...")
+        response = StreamingResponse(
             stream_response(),
             media_type="text/event-stream"
         )
         
+        # Добавляем заголовки для SSE
+        response.headers["Cache-Control"] = "no-cache"
+        response.headers["X-Accel-Buffering"] = "no"
+        
+        debug_log(f"[ANTHROPIC PROXY] Returning response to client")
+        return response
+        
     except Exception as e:
+        debug_log(f"[ANTHROPIC PROXY] ERROR in main handler: {str(e)}")
+        if DEBUG_MODE:
+            import traceback
+            traceback.print_exc()
         request_stats["failed_requests"] += 1
         raise
 
