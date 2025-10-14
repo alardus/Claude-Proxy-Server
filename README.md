@@ -172,10 +172,64 @@ response = requests.post(
 )
 ```
 
+#### Загрузка файлов в Anthropic API
+
+```python
+import anthropic
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+PROXY_API_KEY = os.getenv("PROXY_API_KEY")
+PROXY_BASE_URL = os.getenv("PROXY_BASE_URL")
+
+client = anthropic.Anthropic(
+    base_url=PROXY_BASE_URL,
+    api_key=PROXY_API_KEY
+)
+
+# Загрузка файла
+file_response = client.beta.files.upload(
+    file=("document.pdf", open("/path/to/document.pdf", "rb"), "application/pdf"),
+)
+
+print(f"File uploaded: {file_response.id}")
+```
+
+#### Загрузка файлов в OpenAI API
+
+```python
+from openai import OpenAI
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+PROXY_API_KEY = os.getenv("PROXY_API_KEY")
+PROXY_BASE_URL = os.getenv("PROXY_BASE_URL")
+
+client = OpenAI(
+    base_url=PROXY_BASE_URL,
+    api_key=PROXY_API_KEY
+)
+
+# Загрузка файла для fine-tuning
+file_response = client.files.create(
+    file=open("mydata.jsonl", "rb"),
+    purpose="fine-tune",
+    expires_after={
+        "anchor": "created_at",
+        "seconds": 2592000  # 30 дней
+    }
+)
+
+print(f"File uploaded: {file_response.id}")
+```
+
 ### Доступные endpoints
 
 #### Anthropic API
 - `POST /v1/messages` - проксирование к Anthropic API
+- `POST /v1/files` - загрузка файлов в Anthropic API
 - `POST /v1/{path}` - любые другие пути Anthropic API
 
 **Аутентификация:** заголовок `x-api-key`
@@ -183,6 +237,7 @@ response = requests.post(
 #### OpenAI API
 - `POST /chat/completions` - проксирование к OpenAI Chat Completions API
 - `POST /responses` - проксирование к OpenAI Responses API (Projects)
+- `POST /files` - загрузка файлов в OpenAI API
 
 **Аутентификация:** заголовок `x-api-key` или `Authorization: Bearer`
 
@@ -190,14 +245,19 @@ response = requests.post(
 
 ### Тестирование
 
-#### Тест Anthropic API
+#### Тест Anthropic API (чат)
 ```bash
 python claude-client-test.py
 ```
 
-#### Тест OpenAI API
+#### Тест OpenAI API (чат)
 ```bash
 python openai-client-test.py
+```
+
+#### Тест загрузки файлов (Anthropic и OpenAI)
+```bash
+python test-files-upload.py
 ```
 
 Тестовые скрипты проверяют работу прокси-сервера и выводят результаты запросов.

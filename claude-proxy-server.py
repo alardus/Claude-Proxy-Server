@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, HTTPException, Depends, Form, Response
+from fastapi import FastAPI, Request, HTTPException, Depends, Form, Response, File, UploadFile
 from fastapi.security import APIKeyHeader
 from fastapi.responses import StreamingResponse, HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
@@ -558,6 +558,96 @@ async def admin_login(
     )
     return response
 
+# ============================================================================
+# Anthropic Files API Handler (должен быть ДО общего /v1/{path})
+# ============================================================================
+
+@app.post("/v1/files")
+async def proxy_anthropic_files(
+    request: Request,
+    file: UploadFile = File(...),
+    api_key: str = Depends(verify_api_key)
+):
+    """Обработчик для загрузки файлов в Anthropic API"""
+    start_time = time.time()
+    client_ip = get_client_ip(request)
+    
+    try:
+        with stats_lock:
+            request_stats["total_requests"] += 1
+            request_stats["requests_by_ip"][client_ip] += 1
+        
+        # Читаем файл
+        file_content = await file.read()
+        file_name = file.filename
+        content_type = file.content_type
+        
+        # Подготавливаем заголовки для Anthropic
+        headers = {
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "anthropic-beta": "files-api-2025-04-14"
+        }
+        
+        # Подготавливаем файл для отправки
+        files = {
+            'file': (file_name, file_content, content_type)
+        }
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{ANTHROPIC_API_BASE}/v1/files",
+                headers=headers,
+                files=files,
+                timeout=60.0
+            )
+            
+            # Проверяем статус ответа
+            with stats_lock:
+                if 400 <= response.status_code < 500:
+                    system_metrics["errors_4xx"] += 1
+                elif response.status_code >= 500:
+                    system_metrics["errors_5xx"] += 1
+            
+            # Обновляем статистику
+            end_time = time.time()
+            response_time = (end_time - start_time) * 1000
+            with stats_lock:
+                request_stats["total_response_time"] += response_time
+                request_stats["average_response_time"] = (
+                    request_stats["total_response_time"] / request_stats["total_requests"]
+                )
+                
+                request_stats["last_requests"].append({
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "ip": client_ip,
+                    "path": "/v1/files (Anthropic)",
+                    "response_time": f"{response_time:.2f}ms",
+                    "status": "success" if response.status_code < 400 else "error"
+                })
+            
+            return JSONResponse(
+                status_code=response.status_code,
+                content=response.json()
+            )
+            
+    except Exception as e:
+        request_stats["failed_requests"] += 1
+        system_metrics["errors_5xx"] += 1
+        request_stats["last_requests"].append({
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "ip": client_ip,
+            "path": "/v1/files (Anthropic)",
+            "status": "error",
+            "error": str(e)
+        })
+        logger.error(f"Error uploading file to Anthropic: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============================================================================
+# End of Anthropic Files API Handler
+# ============================================================================
+
 # Маршрут дашборда
 @app.get("/admin/dashboard")
 async def admin_dashboard(
@@ -930,6 +1020,102 @@ async def proxy_openai_responses(
     except Exception as e:
         request_stats["failed_requests"] += 1
         raise
+
+# Обработчик для /files (OpenAI Files API)
+@app.post("/files")
+async def proxy_openai_files(
+    request: Request,
+    file: UploadFile = File(...),
+    purpose: str = Form(...),
+    api_key: str = Depends(verify_api_key_openai)
+):
+    """Обработчик для загрузки файлов в OpenAI API"""
+    start_time = time.time()
+    client_ip = get_client_ip(request)
+    
+    try:
+        with stats_lock:
+            request_stats["total_requests"] += 1
+            request_stats["requests_by_ip"][client_ip] += 1
+        
+        # Читаем файл
+        file_content = await file.read()
+        file_name = file.filename
+        content_type = file.content_type
+        
+        # Подготавливаем заголовки для OpenAI
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}"
+        }
+        
+        # Подготавливаем данные для отправки
+        files = {
+            'file': (file_name, file_content, content_type)
+        }
+        
+        data = {
+            'purpose': purpose
+        }
+        
+        # Получаем дополнительные параметры из формы (если есть)
+        form_data = await request.form()
+        
+        # Обрабатываем expires_after параметры
+        if 'expires_after[anchor]' in form_data:
+            data['expires_after[anchor]'] = form_data['expires_after[anchor]']
+        if 'expires_after[seconds]' in form_data:
+            data['expires_after[seconds]'] = form_data['expires_after[seconds]']
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{OPENAI_API_BASE}/v1/files",
+                headers=headers,
+                files=files,
+                data=data,
+                timeout=60.0
+            )
+            
+            # Проверяем статус ответа
+            with stats_lock:
+                if 400 <= response.status_code < 500:
+                    system_metrics["errors_4xx"] += 1
+                elif response.status_code >= 500:
+                    system_metrics["errors_5xx"] += 1
+            
+            # Обновляем статистику
+            end_time = time.time()
+            response_time = (end_time - start_time) * 1000
+            with stats_lock:
+                request_stats["total_response_time"] += response_time
+                request_stats["average_response_time"] = (
+                    request_stats["total_response_time"] / request_stats["total_requests"]
+                )
+                
+                request_stats["last_requests"].append({
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "ip": client_ip,
+                    "path": "/files (OpenAI)",
+                    "response_time": f"{response_time:.2f}ms",
+                    "status": "success" if response.status_code < 400 else "error"
+                })
+            
+            return JSONResponse(
+                status_code=response.status_code,
+                content=response.json()
+            )
+            
+    except Exception as e:
+        request_stats["failed_requests"] += 1
+        system_metrics["errors_5xx"] += 1
+        request_stats["last_requests"].append({
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "ip": client_ip,
+            "path": "/files (OpenAI)",
+            "status": "error",
+            "error": str(e)
+        })
+        logger.error(f"Error uploading file to OpenAI: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ============================================================================
 # End of OpenAI API Proxy Handlers
