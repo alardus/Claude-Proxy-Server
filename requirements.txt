@@ -10,3 +10,4 @@ python-multipart
 psutil==5.9.8
 py-spy==0.3.14
 uvicorn[standard]==0.27.1
+openai
