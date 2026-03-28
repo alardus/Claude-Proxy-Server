@@ -518,8 +518,8 @@ async def admin_login_page(request: Request):
         return RedirectResponse(url="/admin/dashboard")
     
     return templates.TemplateResponse(
-        "login.html",
-        {"request": request}
+        request=request,
+        name="login.html"
     )
 
 # Маршрут для обработки формы входа
@@ -745,8 +745,9 @@ async def admin_dashboard(
     }
     
     return templates.TemplateResponse(
-        "dashboard.html",
-        {"request": request, "stats": stats}
+        request=request,
+        name="dashboard.html",
+        context={"stats": stats}
     )
 
 # Добавляем отдельный маршрут для API метрик

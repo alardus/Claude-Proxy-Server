@@ -133,7 +133,7 @@ docker compose up -d --build
 # Wait for the container to start
 log "Ожидание запуска контейнера..."
 for i in $(seq 1 15); do
-    if curl -sf "http://127.0.0.1:${DEPLOY_UPSTREAM_PORT}/" &>/dev/null; then
+    if curl -so /dev/null -w "%{http_code}" "http://127.0.0.1:${DEPLOY_UPSTREAM_PORT}/" 2>/dev/null | grep -qE "^[0-9]"; then
         log "Контейнер запущен (порт $DEPLOY_UPSTREAM_PORT)"
         break
     fi
