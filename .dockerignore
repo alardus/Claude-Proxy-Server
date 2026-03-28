@@ -1,0 +1,13 @@
+.git
+.gitignore
+.env
+.env.example
+env.example
+*.md
+deploy/
+aichat-config/
+cline/
+*-test.py
+venv/
+__pycache__/
+.DS_Store

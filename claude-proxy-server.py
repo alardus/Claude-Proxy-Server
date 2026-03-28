@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, HTTPException, Depends, Form, Response
+from fastapi import FastAPI, Request, HTTPException, Depends, Form, Response, File, UploadFile
 from fastapi.security import APIKeyHeader
 from fastapi.responses import StreamingResponse, HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
@@ -255,7 +255,17 @@ logger = logging.getLogger("app")
 load_dotenv()
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 ANTHROPIC_API_BASE = "https://api.anthropic.com"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_API_BASE = "https://api.openai.com"
 PROXY_API_KEY = os.getenv("PROXY_API_KEY")
+
+# Режим отладки (включается через DEBUG_MODE=true в .env)
+DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
+
+def debug_log(message: str):
+    """Выводит отладочное сообщение, если включен DEBUG_MODE"""
+    if DEBUG_MODE:
+        print(message)
 
 # Настройки rate limiting
 MAX_FAILED_ATTEMPTS = 2  # Максимальное количество неудачных попыток
@@ -414,6 +424,72 @@ async def verify_api_key(request: Request, api_key: str = Depends(api_key_header
     failed_attempts[client_ip] = 0
     return api_key
 
+# Функция проверки API ключа для OpenAI (поддерживает x-api-key и Authorization Bearer)
+async def verify_api_key_openai(request: Request):
+    client_ip = get_client_ip(request)
+    
+    # Проверяем, не заблокирован ли IP
+    if time.time() < block_until[client_ip]:
+        logger.warning(f"Too many failed attempts from {client_ip}")
+        raise HTTPException(
+            status_code=403,
+            detail=f"Too many failed attempts. Try again in {int(block_until[client_ip] - time.time())} seconds"
+        )
+    
+    # Пытаемся получить ключ из x-api-key заголовка
+    api_key = request.headers.get("x-api-key")
+    
+    # Если нет x-api-key, пытаемся получить из Authorization Bearer
+    if not api_key:
+        auth_header = request.headers.get("authorization")
+        logger.info(f"OpenAI auth - x-api-key: {api_key}, authorization header: {auth_header[:20] if auth_header else None}...")
+        
+        if auth_header:
+            # Проверяем различные варианты написания Bearer
+            if auth_header.startswith("Bearer "):
+                api_key = auth_header[7:]  # Убираем "Bearer "
+            elif auth_header.startswith("bearer "):
+                api_key = auth_header[7:]  # Убираем "bearer "
+            else:
+                logger.warning(f"Invalid Authorization header format from {client_ip}: {auth_header[:50]}")
+    
+    # Логируем полученный ключ (первые и последние 4 символа)
+    if api_key:
+        logger.info(f"Received API key: {api_key[:4]}...{api_key[-4:]} (length: {len(api_key)})")
+        logger.info(f"Expected API key: {PROXY_API_KEY[:4]}...{PROXY_API_KEY[-4:]} (length: {len(PROXY_API_KEY)})")
+    
+    # Если ключ не найден
+    if not api_key:
+        logger.warning(f"No API key provided from {client_ip}")
+        logger.info(f"All headers: {dict(request.headers)}")
+        raise HTTPException(
+            status_code=403,
+            detail="Not authenticated"
+        )
+    
+    # Проверяем ключ
+    if api_key != PROXY_API_KEY:
+        logger.warning(f"Invalid API key from {client_ip}")
+        logger.warning(f"Key mismatch - received: '{api_key}', expected: '{PROXY_API_KEY}'")
+        failed_attempts[client_ip] += 1
+        
+        if failed_attempts[client_ip] >= MAX_FAILED_ATTEMPTS:
+            block_until[client_ip] = time.time() + BLOCK_DURATION
+            failed_attempts[client_ip] = 0
+            logger.warning(f"Blocking IP {client_ip} for {BLOCK_DURATION/3600} hours")
+            raise HTTPException(
+                status_code=403,
+                detail=f"Too many failed attempts. IP blocked for {BLOCK_DURATION/3600} hours"
+            )
+            
+        raise HTTPException(
+            status_code=403,
+            detail=f"Invalid API key. {MAX_FAILED_ATTEMPTS - failed_attempts[client_ip]} attempts remaining"
+        )
+    
+    failed_attempts[client_ip] = 0
+    return api_key
+
 # Обновляем функцию verify_admin для работы с куки
 async def verify_admin(request: Request):
     client_ip = get_client_ip(request)
@@ -442,8 +518,8 @@ async def admin_login_page(request: Request):
         return RedirectResponse(url="/admin/dashboard")
     
     return templates.TemplateResponse(
-        "login.html",
-        {"request": request}
+        request=request,
+        name="login.html"
     )
 
 # Маршрут для обработки формы входа
@@ -489,6 +565,103 @@ async def admin_login(
         secure=True
     )
     return response
+
+# ============================================================================
+# Anthropic Files API Handler (должен быть ДО общего /v1/{path})
+# ============================================================================
+
+@app.post("/v1/files")
+async def proxy_anthropic_files(
+    request: Request,
+    file: UploadFile = File(...),
+    api_key: str = Depends(verify_api_key)
+):
+    """Обработчик для загрузки файлов в Anthropic API"""
+    start_time = time.time()
+    client_ip = get_client_ip(request)
+    
+    try:
+        with stats_lock:
+            request_stats["total_requests"] += 1
+            request_stats["requests_by_ip"][client_ip] += 1
+        
+        # Читаем файл
+        file_content = await file.read()
+        file_name = file.filename
+        content_type = file.content_type
+        
+        # Подготавливаем заголовки для Anthropic
+        headers = {
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "anthropic-beta": "files-api-2025-04-14,pdfs-2024-09-25"
+        }
+        
+        debug_log(f"[ANTHROPIC FILES] Uploading file: {file_name}, content_type: {content_type}")
+        debug_log(f"[ANTHROPIC FILES] File size: {len(file_content)} bytes")
+        
+        # Подготавливаем файл для отправки
+        files = {
+            'file': (file_name, file_content, content_type)
+        }
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{ANTHROPIC_API_BASE}/v1/files",
+                headers=headers,
+                files=files,
+                timeout=60.0
+            )
+            
+            debug_log(f"[ANTHROPIC FILES] Response status: {response.status_code}")
+            response_data = response.json()
+            debug_log(f"[ANTHROPIC FILES] Response data: {response_data}")
+            
+            # Проверяем статус ответа
+            with stats_lock:
+                if 400 <= response.status_code < 500:
+                    system_metrics["errors_4xx"] += 1
+                elif response.status_code >= 500:
+                    system_metrics["errors_5xx"] += 1
+            
+            # Обновляем статистику
+            end_time = time.time()
+            response_time = (end_time - start_time) * 1000
+            with stats_lock:
+                request_stats["total_response_time"] += response_time
+                request_stats["average_response_time"] = (
+                    request_stats["total_response_time"] / request_stats["total_requests"]
+                )
+                
+                request_stats["last_requests"].append({
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "ip": client_ip,
+                    "path": "/v1/files (Anthropic)",
+                    "response_time": f"{response_time:.2f}ms",
+                    "status": "success" if response.status_code < 400 else "error"
+                })
+            
+            return JSONResponse(
+                status_code=response.status_code,
+                content=response_data
+            )
+            
+    except Exception as e:
+        request_stats["failed_requests"] += 1
+        system_metrics["errors_5xx"] += 1
+        request_stats["last_requests"].append({
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "ip": client_ip,
+            "path": "/v1/files (Anthropic)",
+            "status": "error",
+            "error": str(e)
+        })
+        logger.error(f"Error uploading file to Anthropic: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============================================================================
+# End of Anthropic Files API Handler
+# ============================================================================
 
 # Маршрут дашборда
 @app.get("/admin/dashboard")
@@ -572,8 +745,9 @@ async def admin_dashboard(
     }
     
     return templates.TemplateResponse(
-        "dashboard.html",
-        {"request": request, "stats": stats}
+        request=request,
+        name="dashboard.html",
+        context={"stats": stats}
     )
 
 # Добавляем отдельный маршрут для API метрик
@@ -639,9 +813,147 @@ async def proxy_request(
             request_stats["requests_by_ip"][client_ip] += 1
         
         body = await request.json()
+        
+        # Логируем входящий запрос
+        debug_log(f"\n{'='*80}")
+        debug_log(f"[ANTHROPIC PROXY] Request to path: /{path}")
+        debug_log(f"[ANTHROPIC PROXY] Query params: {dict(request.query_params)}")
+        debug_log(f"[ANTHROPIC PROXY] Number of messages: {len(body.get('messages', []))}")
+        
+        if body.get('messages'):
+            first_msg = body['messages'][0]
+            content = first_msg.get('content', [])
+            debug_log(f"[ANTHROPIC PROXY] First message has {len(content)} content items")
+            
+            # Проверяем наличие файлов
+            has_files = any('file_id' in str(item) for item in content)
+            debug_log(f"[ANTHROPIC PROXY] Request contains files: {has_files}")
+        
+        debug_log(f"{'='*80}\n")
+        
         headers = {
             "x-api-key": ANTHROPIC_API_KEY,
             "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json"
+        }
+        
+        # Добавляем beta заголовок для поддержки файлов и других бета-функций
+        # Клиент может отправить ?beta=true, но Anthropic требует конкретные версии
+        if request.query_params.get("beta") or "file_id" in str(body):
+            # Добавляем поддержку files API (ВАЖНО: files-api-2025-04-14 должен быть первым!)
+            headers["anthropic-beta"] = "files-api-2025-04-14,pdfs-2024-09-25,prompt-caching-2024-07-31"
+            debug_log(f"[ANTHROPIC PROXY] Added anthropic-beta header: {headers['anthropic-beta']}")
+        
+        async def stream_response():
+            try:
+                debug_log(f"[ANTHROPIC PROXY] Starting request to Anthropic API...")
+                async with httpx.AsyncClient() as client:
+                    async with client.stream(
+                        "POST",
+                        f"{ANTHROPIC_API_BASE}/v1/{path}",
+                        headers=headers,
+                        json=body,
+                        timeout=None
+                    ) as response:
+                        # Проверяем статус ответа
+                        debug_log(f"[ANTHROPIC PROXY] Response status: {response.status_code}")
+                        debug_log(f"[ANTHROPIC PROXY] Response headers: {dict(response.headers)}")
+                        
+                        with stats_lock:
+                            if 400 <= response.status_code < 500:
+                                system_metrics["errors_4xx"] += 1
+                            elif response.status_code >= 500:
+                                system_metrics["errors_5xx"] += 1
+                        
+                        chunk_count = 0
+                        total_bytes = 0
+                        async for chunk in response.aiter_bytes():
+                            chunk_count += 1
+                            total_bytes += len(chunk)
+                            if chunk_count <= 10:  # Логируем первые 10 чанков
+                                debug_log(f"[ANTHROPIC PROXY] Chunk #{chunk_count} ({len(chunk)} bytes): {chunk[:150]}")
+                            yield chunk
+                        
+                        debug_log(f"[ANTHROPIC PROXY] Stream complete. Total chunks: {chunk_count}, total bytes: {total_bytes}")
+                            
+                # Обновляем статистику после успешного запроса
+                end_time = time.time()
+                response_time = (end_time - start_time) * 1000  # в миллисекундах
+                with stats_lock:
+                    request_stats["total_response_time"] += response_time
+                    request_stats["average_response_time"] = (
+                        request_stats["total_response_time"] / request_stats["total_requests"]
+                    )
+                    
+                    request_stats["last_requests"].append({
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "ip": client_ip,
+                        "path": path,
+                        "response_time": f"{response_time:.2f}ms",
+                        "status": "success"
+                    })
+                
+            except Exception as e:
+                debug_log(f"[ANTHROPIC PROXY] ERROR in stream_response: {str(e)}")
+                debug_log(f"[ANTHROPIC PROXY] Error type: {type(e).__name__}")
+                if DEBUG_MODE:
+                    import traceback
+                    traceback.print_exc()
+                
+                request_stats["failed_requests"] += 1
+                system_metrics["errors_5xx"] += 1
+                request_stats["last_requests"].append({
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "ip": client_ip,
+                    "path": path,
+                    "status": "error",
+                    "error": str(e)
+                })
+                raise
+                
+        # Создаем StreamingResponse с правильными заголовками для Anthropic
+        debug_log(f"[ANTHROPIC PROXY] Creating StreamingResponse...")
+        response = StreamingResponse(
+            stream_response(),
+            media_type="text/event-stream"
+        )
+        
+        # Добавляем заголовки для SSE
+        response.headers["Cache-Control"] = "no-cache"
+        response.headers["X-Accel-Buffering"] = "no"
+        
+        debug_log(f"[ANTHROPIC PROXY] Returning response to client")
+        return response
+        
+    except Exception as e:
+        debug_log(f"[ANTHROPIC PROXY] ERROR in main handler: {str(e)}")
+        if DEBUG_MODE:
+            import traceback
+            traceback.print_exc()
+        request_stats["failed_requests"] += 1
+        raise
+
+# ============================================================================
+# OpenAI API Proxy Handlers
+# ============================================================================
+
+# Обработчик для /chat/completions (OpenAI Chat API)
+@app.post("/chat/completions")
+async def proxy_openai_chat(
+    request: Request,
+    api_key: str = Depends(verify_api_key_openai)
+):
+    start_time = time.time()
+    client_ip = get_client_ip(request)
+    
+    try:
+        with stats_lock:
+            request_stats["total_requests"] += 1
+            request_stats["requests_by_ip"][client_ip] += 1
+        
+        body = await request.json()
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
             "Content-Type": "application/json"
         }
         
@@ -650,7 +962,7 @@ async def proxy_request(
                 async with httpx.AsyncClient() as client:
                     async with client.stream(
                         "POST",
-                        f"{ANTHROPIC_API_BASE}/v1/{path}",
+                        f"{OPENAI_API_BASE}/v1/chat/completions",
                         headers=headers,
                         json=body,
                         timeout=None
@@ -677,7 +989,7 @@ async def proxy_request(
                     request_stats["last_requests"].append({
                         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "ip": client_ip,
-                        "path": path,
+                        "path": "/chat/completions (OpenAI)",
                         "response_time": f"{response_time:.2f}ms",
                         "status": "success"
                     })
@@ -688,7 +1000,7 @@ async def proxy_request(
                 request_stats["last_requests"].append({
                     "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "ip": client_ip,
-                    "path": path,
+                    "path": "/chat/completions (OpenAI)",
                     "status": "error",
                     "error": str(e)
                 })
@@ -702,6 +1014,184 @@ async def proxy_request(
     except Exception as e:
         request_stats["failed_requests"] += 1
         raise
+
+# Обработчик для /responses (OpenAI Projects API)
+@app.post("/responses")
+async def proxy_openai_responses(
+    request: Request,
+    api_key: str = Depends(verify_api_key_openai)
+):
+    start_time = time.time()
+    client_ip = get_client_ip(request)
+    
+    try:
+        with stats_lock:
+            request_stats["total_requests"] += 1
+            request_stats["requests_by_ip"][client_ip] += 1
+        
+        body = await request.json()
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        async def stream_response():
+            try:
+                async with httpx.AsyncClient() as client:
+                    async with client.stream(
+                        "POST",
+                        f"{OPENAI_API_BASE}/v1/responses",
+                        headers=headers,
+                        json=body,
+                        timeout=None
+                    ) as response:
+                        # Проверяем статус ответа
+                        with stats_lock:
+                            if 400 <= response.status_code < 500:
+                                system_metrics["errors_4xx"] += 1
+                            elif response.status_code >= 500:
+                                system_metrics["errors_5xx"] += 1
+                            
+                        async for chunk in response.aiter_bytes():
+                            yield chunk
+                            
+                # Обновляем статистику после успешного запроса
+                end_time = time.time()
+                response_time = (end_time - start_time) * 1000  # в миллисекундах
+                with stats_lock:
+                    request_stats["total_response_time"] += response_time
+                    request_stats["average_response_time"] = (
+                        request_stats["total_response_time"] / request_stats["total_requests"]
+                    )
+                    
+                    request_stats["last_requests"].append({
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "ip": client_ip,
+                        "path": "/responses (OpenAI)",
+                        "response_time": f"{response_time:.2f}ms",
+                        "status": "success"
+                    })
+                
+            except Exception as e:
+                request_stats["failed_requests"] += 1
+                system_metrics["errors_5xx"] += 1
+                request_stats["last_requests"].append({
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "ip": client_ip,
+                    "path": "/responses (OpenAI)",
+                    "status": "error",
+                    "error": str(e)
+                })
+                raise
+                
+        return StreamingResponse(
+            stream_response(),
+            media_type="text/event-stream"
+        )
+        
+    except Exception as e:
+        request_stats["failed_requests"] += 1
+        raise
+
+# Обработчик для /files (OpenAI Files API)
+@app.post("/files")
+async def proxy_openai_files(
+    request: Request,
+    file: UploadFile = File(...),
+    purpose: str = Form(...),
+    api_key: str = Depends(verify_api_key_openai)
+):
+    """Обработчик для загрузки файлов в OpenAI API"""
+    start_time = time.time()
+    client_ip = get_client_ip(request)
+    
+    try:
+        with stats_lock:
+            request_stats["total_requests"] += 1
+            request_stats["requests_by_ip"][client_ip] += 1
+        
+        # Читаем файл
+        file_content = await file.read()
+        file_name = file.filename
+        content_type = file.content_type
+        
+        # Подготавливаем заголовки для OpenAI
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}"
+        }
+        
+        # Подготавливаем данные для отправки
+        files = {
+            'file': (file_name, file_content, content_type)
+        }
+        
+        data = {
+            'purpose': purpose
+        }
+        
+        # Получаем дополнительные параметры из формы (если есть)
+        form_data = await request.form()
+        
+        # Обрабатываем expires_after параметры
+        if 'expires_after[anchor]' in form_data:
+            data['expires_after[anchor]'] = form_data['expires_after[anchor]']
+        if 'expires_after[seconds]' in form_data:
+            data['expires_after[seconds]'] = form_data['expires_after[seconds]']
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{OPENAI_API_BASE}/v1/files",
+                headers=headers,
+                files=files,
+                data=data,
+                timeout=60.0
+            )
+            
+            # Проверяем статус ответа
+            with stats_lock:
+                if 400 <= response.status_code < 500:
+                    system_metrics["errors_4xx"] += 1
+                elif response.status_code >= 500:
+                    system_metrics["errors_5xx"] += 1
+            
+            # Обновляем статистику
+            end_time = time.time()
+            response_time = (end_time - start_time) * 1000
+            with stats_lock:
+                request_stats["total_response_time"] += response_time
+                request_stats["average_response_time"] = (
+                    request_stats["total_response_time"] / request_stats["total_requests"]
+                )
+                
+                request_stats["last_requests"].append({
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "ip": client_ip,
+                    "path": "/files (OpenAI)",
+                    "response_time": f"{response_time:.2f}ms",
+                    "status": "success" if response.status_code < 400 else "error"
+                })
+            
+            return JSONResponse(
+                status_code=response.status_code,
+                content=response.json()
+            )
+            
+    except Exception as e:
+        request_stats["failed_requests"] += 1
+        system_metrics["errors_5xx"] += 1
+        request_stats["last_requests"].append({
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "ip": client_ip,
+            "path": "/files (OpenAI)",
+            "status": "error",
+            "error": str(e)
+        })
+        logger.error(f"Error uploading file to OpenAI: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============================================================================
+# End of OpenAI API Proxy Handlers
+# ============================================================================
 
 # Добавляем middleware для отслеживания запросов Uvicorn
 @app.middleware("http")
